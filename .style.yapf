@@ -1,0 +1,8 @@
+[style]
+based_on_style = pep8
+column_limit = 120
+continuation_align_style = SPACE
+split_before_first_argument = false
+dedent_closing_brackets = false
+split_all_top_level_comma_separated_values = true
+disable_ending_comma_heuristic = true

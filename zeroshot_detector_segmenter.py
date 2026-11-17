@@ -26,33 +26,21 @@ import cv2
 import numpy as np
 from numpy.typing import NDArray
 import torch
-from transformers import (
-    AutoProcessor,
-    AutoModelForZeroShotObjectDetection,
-    Sam2Processor,
-    Sam2Model,
-)
+from transformers import (AutoProcessor, AutoModelForZeroShotObjectDetection, Sam2Processor, Sam2Model, )
+from utils import get_supported_fp16
 
-def get_supported_fp16(device: str) -> torch.dtype:
-
-    if device != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError("GPU is not available. Can't use FP16. Re-initialize without the --fp16 arg.")
-    
-    if torch.cuda.is_bf16_supported():
-        return torch.bfloat16
-    return torch.float16
 
 class DetectionResult(TypedDict):
     boxes: torch.Tensor
     scores: torch.Tensor
     text_labels: list[str]
-    
+
+
 class OpenVocabSegmentationApp:
+
     def __init__(self, classes_file: Path | str, fp16: bool = False) -> None:
         labels = Path(classes_file).read_text(encoding="utf-8").splitlines()
-        self.classes = list(dict.fromkeys(
-            " ".join(label.lower().split()) for label in labels if label.strip()
-        ))
+        self.classes = list(dict.fromkeys(" ".join(label.lower().split()) for label in labels if label.strip()))
         if not self.classes:
             raise ValueError("The classes file must contain at least one non-empty label")
         self.label_colors = self.initColorPalette(self.classes)
@@ -70,9 +58,7 @@ class OpenVocabSegmentationApp:
             colors[label] = (round(blue * 255), round(green * 255), round(red * 255))
         return colors
 
-    def initDetector(
-        self, model_id: str = "IDEA-Research/grounding-dino-tiny"
-    ) -> None:
+    def initDetector(self, model_id: str = "IDEA-Research/grounding-dino-tiny") -> None:
         """Load a zero-shot detector and processor, replacing the cache on success."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using {device} for inference")
@@ -82,9 +68,7 @@ class OpenVocabSegmentationApp:
         model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
         self._det_processor, self._det_model = processor, model
 
-    def initSegmenter(
-        self, model_id: str = "facebook/sam2-hiera-tiny"
-    ) -> None:
+    def initSegmenter(self, model_id: str = "facebook/sam2-hiera-tiny") -> None:
         """Load a segmenter and processor, replacing the cache on success."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using {device} for inference")
@@ -93,9 +77,7 @@ class OpenVocabSegmentationApp:
         model = Sam2Model.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
         self._sam_processor, self._sam_model = processor, model
 
-    def detect(
-        self, frame: NDArray[np.uint8]
-    ) -> tuple[DetectionResult, float]:
+    def detect(self, frame: NDArray[np.uint8]) -> tuple[DetectionResult, float]:
         """Return detections and inference milliseconds, excluding model loading."""
         text_prompt = " . ".join(self.classes) + " ."
 
@@ -104,18 +86,16 @@ class OpenVocabSegmentationApp:
             torch.cuda.synchronize(device)
         start = perf_counter()
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        inputs = self._det_processor(
-            images=rgb_frame, text=text_prompt, return_tensors="pt"
-        ).to(device, self._det_model.dtype)
+        inputs = self._det_processor(images=rgb_frame, text=text_prompt,
+                                     return_tensors="pt").to(device, self._det_model.dtype)
         with torch.inference_mode():
             outputs = self._det_model(**inputs)
-            results = self._det_processor.post_process_grounded_object_detection(
-                outputs,
-                inputs.input_ids,
-                threshold=0.45,
-                text_threshold=0.25,
-                target_sizes=[frame.shape[:2]],
-            )[0]
+            results = self._det_processor.post_process_grounded_object_detection(outputs,
+                                                                                 inputs.input_ids,
+                                                                                 threshold=0.45,
+                                                                                 text_threshold=0.25,
+                                                                                 target_sizes=[frame.shape[:2]],
+                                                                                 )[0]
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         inference_ms = (perf_counter() - start) * 1000
@@ -130,29 +110,23 @@ class OpenVocabSegmentationApp:
             return np.empty((0, *frame.shape[:2]), dtype=np.uint8)
         device = self._sam_model.device
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        inputs = self._sam_processor(
-            images=rgb_frame,
-            input_boxes=[boxes.detach().cpu().tolist()],
-            return_tensors="pt",
-        ).to(device, self._sam_model.dtype)
+        inputs = self._sam_processor(images=rgb_frame,
+                                     input_boxes=[boxes.detach().cpu().tolist()],
+                                     return_tensors="pt",
+                                     ).to(device, self._sam_model.dtype)
         with torch.inference_mode():
             outputs = self._sam_model(**inputs)
             best_indices = outputs.iou_scores[0].argmax(dim=-1)
             box_indices = torch.arange(len(boxes), device=best_indices.device)
             best_masks = outputs.pred_masks[0][box_indices, best_indices]
-            masks = self._sam_processor.post_process_masks(
-                best_masks.unsqueeze(0).unsqueeze(2).float().cpu(),
-                inputs["original_sizes"].cpu(),
-                binarize=True,
-            )[0][:, 0]
+            masks = self._sam_processor.post_process_masks(best_masks.unsqueeze(0).unsqueeze(2).float().cpu(),
+                                                           inputs["original_sizes"].cpu(),
+                                                           binarize=True,
+                                                           )[0][:, 0]
         return masks.detach().cpu().numpy().astype(np.uint8)
 
-    def draw(
-        self,
-        frame: NDArray[np.uint8],
-        detections: DetectionResult,
-        masks: NDArray[np.uint8] | None,
-    ) -> NDArray[np.uint8]:
+    def draw(self, frame: NDArray[np.uint8], detections: DetectionResult, masks: NDArray[np.uint8] | None,
+             ) -> NDArray[np.uint8]:
         """Return a frame copy with mask overlays, boxes, labels, and scores."""
         boxes = detections["boxes"].detach().cpu().tolist()
         scores = detections["scores"].detach().cpu().tolist()
@@ -164,9 +138,7 @@ class OpenVocabSegmentationApp:
         normalized_labels = [" ".join(label.lower().split()) for label in labels]
         unknown_labels = set(normalized_labels) - self.label_colors.keys()
         if unknown_labels:
-            raise ValueError(
-                f"Detected labels are not in the classes file: {sorted(unknown_labels)}"
-            )
+            raise ValueError(f"Detected labels are not in the classes file: {sorted(unknown_labels)}")
         colors = [self.label_colors[label] for label in normalized_labels]
         frame = frame.copy()
         if masks is not None:
@@ -177,31 +149,26 @@ class OpenVocabSegmentationApp:
                 mask = masks[index] != 0
                 overlay[mask] = colors[index]
                 foreground |= mask
-            frame[foreground] = (
-                frame[foreground] * 0.5 + overlay[foreground] * 0.5
-            ).astype(np.uint8)
+            frame[foreground] = (frame[foreground] * 0.5 + overlay[foreground] * 0.5).astype(np.uint8)
         for box, label, score, color in zip(boxes, labels, scores, colors):
             x1, y1, x2, y2 = map(int, box)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(
-                frame, f"{label}: {score:.2f}",
-                (max(0, x1), max(20, y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2,
-            )
+            cv2.putText(frame,
+                        f"{label}: {score:.2f}", (max(0, x1), max(20, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        color,
+                        2,
+                        )
         return frame
-
 
     @staticmethod
     def parse_args() -> argparse.Namespace:
         """Parse and validate CLI arguments before loading models."""
         parser = argparse.ArgumentParser(description=__doc__)
         parser.add_argument("video", type=Path, help="Path to the input video")
-        parser.add_argument(
-            "classes_file", type=Path, help="Required UTF-8 text file, one class label per line"
-        )
-        parser.add_argument(
-            "--output-vid", type=Path, help="Optional output video path (.mp4 or .avi)"
-        )
+        parser.add_argument("classes_file", type=Path, help="Required UTF-8 text file, one class label per line")
+        parser.add_argument("--output-vid", type=Path, help="Optional output video path (.mp4 or .avi)")
         parser.add_argument("--fp16", action="store_true", help="Use FP16 precision for inference")
         args = parser.parse_args()
         if not args.video.is_file():
@@ -231,12 +198,7 @@ class OpenVocabSegmentationApp:
                     raise RuntimeError(f"Invalid source video frame rate: {fps}")
                 height, width = frame.shape[:2]
                 codec = "mp4v" if args.output_vid.suffix.lower() == ".mp4" else "MJPG"
-                writer = cv2.VideoWriter(
-                    str(args.output_vid),
-                    cv2.VideoWriter_fourcc(*codec),
-                    fps,
-                    (width, height),
-                )
+                writer = cv2.VideoWriter(str(args.output_vid), cv2.VideoWriter_fourcc(*codec), fps, (width, height), )
                 if not writer.isOpened():
                     raise RuntimeError(f"Could not create output video: {args.output_vid}")
 
@@ -251,10 +213,7 @@ class OpenVocabSegmentationApp:
 
                 timing_text = f"Inference: {inference_ms:.1f} ms"
                 for color, thickness in [((0, 0, 0), 4), ((255, 255, 255), 2)]:
-                    cv2.putText(
-                        frame, timing_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.7, color, thickness,
-                    )
+                    cv2.putText(frame, timing_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness, )
                 if writer is not None:
                     writer.write(frame)
                 cv2.imshow(window_name, frame)
