@@ -1,2 +1,5 @@
 vehicles
 containers
+humans
+cranes
+buildings

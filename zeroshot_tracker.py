@@ -34,7 +34,7 @@ from numpy.typing import NDArray
 import torch
 from transformers import (AutoProcessor, AutoModelForZeroShotObjectDetection, Sam2VideoProcessor, Sam2VideoModel, )
 from transformers.models.sam2_video.modeling_sam2_video import Sam2VideoInferenceSession
-from utils import mask_to_bbox, get_supported_fp16
+from utils import mask_to_bbox, get_supported_fp16, class_aware_nms
 
 
 class DetectionResult(TypedDict):
@@ -91,7 +91,7 @@ class OpenVocabSegmentationApp:
         self._tracking_session = None
 
     def detect(self, frame: NDArray[np.uint8]) -> tuple[DetectionResult, float]:
-        """Return detections and inference milliseconds, excluding model loading."""
+        """Return class-aware NMS-filtered detections (IoU 0.5) and inference ms."""
         text_prompt = " . ".join(self.classes) + " ."
 
         device = self._det_model.device
@@ -105,9 +105,15 @@ class OpenVocabSegmentationApp:
             outputs = self._det_model(**inputs)
             results = self._det_processor.post_process_grounded_object_detection(outputs,
                                                                                  inputs.input_ids,
-                                                                                 threshold=0.45,
+                                                                                 threshold=0.35,
                                                                                  text_threshold=0.25,
                                                                                  target_sizes=[frame.shape[:2]])[0]
+        keep = class_aware_nms(results["boxes"], results["scores"], results["text_labels"])
+        results = {
+            "boxes": results["boxes"][keep],
+            "scores": results["scores"][keep.to(results["scores"].device)],
+            "text_labels": [results["text_labels"][index] for index in keep.tolist()],
+        }
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         inference_ms = (perf_counter() - start) * 1000
