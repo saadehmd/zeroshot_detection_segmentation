@@ -1,5 +1,7 @@
 """Detect and segment video objects; press Q or Escape to stop.
 
+Press Right Arrow to skip the next 10 frames. Skipped frames are not inferred
+or included in the saved output video.
 Usage: python ground_dino_detector.py input.mp4 classes.txt --output-vid annotated.mp4
 The required UTF-8 classes file contains one label per line. Blank lines are
 ignored; labels are lowercased and deduplicated in file order.
@@ -10,6 +12,9 @@ and inference time in milliseconds. The constructor initializes both models
 and processors; pass fp16=True to select reduced precision.
 initDetector(model_id) explicitly loads or replaces the cached detector using
 Auto factories. detect() requires compatible grounded-detection processing.
+Detection assigns each box the configured label with the highest token score,
+excluding special/separator tokens, before thresholding and class-aware NMS.
+No text threshold or free-form label decoding is used.
 segment(frame, detections) returns one binary uint8 mask per box, shaped
 (number_of_boxes, height, width). draw() returns an annotated frame copy.
 The displayed inference time includes detection and segmentation.
@@ -27,7 +32,7 @@ import numpy as np
 from numpy.typing import NDArray
 import torch
 from transformers import (AutoProcessor, AutoModelForZeroShotObjectDetection, Sam2Processor, Sam2Model, )
-from utils import get_supported_fp16, class_aware_nms
+from utils import get_supported_fp16, class_aware_nms, get_detection_labels_with_max_confidence
 
 
 class DetectionResult(TypedDict):
@@ -78,7 +83,7 @@ class OpenVocabSegmentationApp:
         self._sam_processor, self._sam_model = processor, model
 
     def detect(self, frame: NDArray[np.uint8]) -> tuple[DetectionResult, float]:
-        """Return class-aware NMS-filtered detections (IoU 0.5) and inference ms."""
+        """Return one configured label per box, class-aware NMS (IoU 0.5), and ms."""
         text_prompt = " . ".join(self.classes) + " ."
 
         device = self._det_model.device
@@ -86,16 +91,18 @@ class OpenVocabSegmentationApp:
             torch.cuda.synchronize(device)
         start = perf_counter()
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        inputs = self._det_processor(images=rgb_frame, text=text_prompt,
-                                     return_tensors="pt").to(device, self._det_model.dtype)
+        inputs = self._det_processor(images=rgb_frame,
+                                     text=text_prompt,
+                                     return_tensors="pt",
+                                     return_offsets_mapping=True).to(device, self._det_model.dtype)
+        offsets = inputs.pop("offset_mapping")[0]
         with torch.inference_mode():
             outputs = self._det_model(**inputs)
-            results = self._det_processor.post_process_grounded_object_detection(outputs,
-                                                                                 inputs.input_ids,
-                                                                                 threshold=0.35,
-                                                                                 text_threshold=0.25,
-                                                                                 target_sizes=[frame.shape[:2]],
-                                                                                 )[0]
+            boxes, scores, labels = get_detection_labels_with_max_confidence(
+                outputs.logits[0], outputs.pred_boxes[0], offsets,
+                self.classes, frame.shape[:2], threshold=0.2,
+            )
+            results = {"boxes": boxes, "scores": scores, "text_labels": labels}
         keep = class_aware_nms(results["boxes"], results["scores"], results["text_labels"])
         results = {
             "boxes": results["boxes"][keep],
@@ -141,11 +148,10 @@ class OpenVocabSegmentationApp:
             raise ValueError("Detection boxes, scores, and labels must have matching counts")
         if masks is not None and masks.shape != (len(boxes), *frame.shape[:2]):
             raise ValueError("Masks must have shape (N, frame height, frame width)")
-        normalized_labels = [" ".join(label.lower().split()) for label in labels]
-        unknown_labels = set(normalized_labels) - self.label_colors.keys()
+        unknown_labels = set(labels) - self.label_colors.keys()
         if unknown_labels:
             raise ValueError(f"Detected labels are not in the classes file: {sorted(unknown_labels)}")
-        colors = [self.label_colors[label] for label in normalized_labels]
+        colors = [self.label_colors[label] for label in labels]
         frame = frame.copy()
         if masks is not None:
             overlay = np.zeros_like(frame)
@@ -208,7 +214,7 @@ class OpenVocabSegmentationApp:
                 if not writer.isOpened():
                     raise RuntimeError(f"Could not create output video: {args.output_vid}")
 
-            window_name = "Grounding DINO - Q / Esc to quit"
+            window_name = "Grounding DINO - Right: skip 10 frames | Q / Esc: quit"
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             while success:
                 results, inference_ms = self.detect(frame)
@@ -223,10 +229,15 @@ class OpenVocabSegmentationApp:
                 if writer is not None:
                     writer.write(frame)
                 cv2.imshow(window_name, frame)
-                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                key = cv2.waitKeyEx(1)
+                if key in (ord("q"), 27):
                     break
                 if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                     break
+                if key in (65363, 2555904, 16777236):
+                    for _ in range(10):
+                        if not capture.grab():
+                            break
                 success, frame = capture.read()
         finally:
             capture.release()

@@ -1,5 +1,7 @@
 """Detect and segment video objects; press Q or Escape to stop.
 
+Press Right Arrow to skip the next 10 frames and refresh detection/tracking.
+Skipped frames are not processed or included in the saved output video.
 Usage: python zeroshot_detector_segmenter.py input.mp4 classes.txt --output-vid annotated.mp4
 The required UTF-8 classes file contains one label per line. Blank lines are
 ignored; labels are lowercased and deduplicated in file order.
@@ -10,6 +12,9 @@ and inference time in milliseconds. The constructor initializes both models
 and processors; pass fp16=True to select reduced precision.
 initDetector(model_id) explicitly loads or replaces the cached detector using
 Auto factories. detect() requires compatible grounded-detection processing.
+Detection assigns each box the configured label with the highest token score,
+excluding special/separator tokens, before thresholding and class-aware NMS.
+No text threshold or free-form label decoding is used.
 segment(frame, detections) returns one binary uint8 mask per box, shaped
 (number_of_boxes, height, width). draw() returns an annotated frame copy.
 Detection runs on frames 0, 10, 20, ...; SAM2 propagates box-prompted masks
@@ -34,7 +39,7 @@ from numpy.typing import NDArray
 import torch
 from transformers import (AutoProcessor, AutoModelForZeroShotObjectDetection, Sam2VideoProcessor, Sam2VideoModel, )
 from transformers.models.sam2_video.modeling_sam2_video import Sam2VideoInferenceSession
-from utils import mask_to_bbox, get_supported_fp16, class_aware_nms
+from utils import mask_to_bbox, get_supported_fp16, class_aware_nms, get_detection_labels_with_max_confidence
 
 
 class DetectionResult(TypedDict):
@@ -91,7 +96,7 @@ class OpenVocabSegmentationApp:
         self._tracking_session = None
 
     def detect(self, frame: NDArray[np.uint8]) -> tuple[DetectionResult, float]:
-        """Return class-aware NMS-filtered detections (IoU 0.5) and inference ms."""
+        """Return one configured label per box, class-aware NMS (IoU 0.5), and ms."""
         text_prompt = " . ".join(self.classes) + " ."
 
         device = self._det_model.device
@@ -99,15 +104,18 @@ class OpenVocabSegmentationApp:
             torch.cuda.synchronize(device)
         start = perf_counter()
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        inputs = self._det_processor(images=rgb_frame, text=text_prompt,
-                                     return_tensors="pt").to(device, self._det_model.dtype)
+        inputs = self._det_processor(images=rgb_frame,
+                                     text=text_prompt,
+                                     return_tensors="pt",
+                                     return_offsets_mapping=True).to(device, self._det_model.dtype)
+        offsets = inputs.pop("offset_mapping")[0]
         with torch.inference_mode():
             outputs = self._det_model(**inputs)
-            results = self._det_processor.post_process_grounded_object_detection(outputs,
-                                                                                 inputs.input_ids,
-                                                                                 threshold=0.35,
-                                                                                 text_threshold=0.25,
-                                                                                 target_sizes=[frame.shape[:2]])[0]
+            boxes, scores, labels = get_detection_labels_with_max_confidence(
+                outputs.logits[0], outputs.pred_boxes[0], offsets,
+                self.classes, frame.shape[:2], threshold=0.35,
+            )
+            results = {"boxes": boxes, "scores": scores, "text_labels": labels}
         keep = class_aware_nms(results["boxes"], results["scores"], results["text_labels"])
         results = {
             "boxes": results["boxes"][keep],
@@ -202,11 +210,10 @@ class OpenVocabSegmentationApp:
             raise ValueError("Detection boxes, scores, and labels must have matching counts")
         if masks is not None and masks.shape != (len(boxes), *frame.shape[:2]):
             raise ValueError("Masks must have shape (N, frame height, frame width)")
-        normalized_labels = [" ".join(label.lower().split()) for label in labels]
-        unknown_labels = set(normalized_labels) - self.label_colors.keys()
+        unknown_labels = set(labels) - self.label_colors.keys()
         if unknown_labels:
             raise ValueError(f"Detected labels are not in the classes file: {sorted(unknown_labels)}")
-        colors = [self.label_colors[label] for label in normalized_labels]
+        colors = [self.label_colors[label] for label in labels]
         frame = frame.copy()
         if masks is not None:
             overlay = np.zeros_like(frame)
@@ -269,19 +276,21 @@ class OpenVocabSegmentationApp:
                 if not writer.isOpened():
                     raise RuntimeError(f"Could not create output video: {args.output_vid}")
 
-            window_name = "Grounding DINO - Q / Esc to quit"
+            window_name = "Grounding DINO - Right: skip 10 frames | Q / Esc: quit"
             cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
             self._tracking_session = None
             frame_idx = 0
+            refresh_detection = False
             while success:
                 device = self._sam_model.device
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
                 start = perf_counter()
-                if frame_idx % 20 == 0:
+                if refresh_detection or frame_idx % 20 == 0:
                     # Perform detection every 10 frames only.
                     detections, _ = self.detect(frame)
                     results, masks = self.track(frame, detections)
+                    refresh_detection = False
                 else:
                     # Use SAM2's mask tracking capability for subsequent frames.
                     results, masks = self.track(frame)
@@ -296,10 +305,18 @@ class OpenVocabSegmentationApp:
                 if writer is not None:
                     writer.write(frame)
                 cv2.imshow(window_name, frame)
-                if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                key = cv2.waitKeyEx(1)
+                if key in (ord("q"), 27):
                     break
                 if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                     break
+                if key in (65363, 2555904, 16777236):
+                    for _ in range(10):
+                        if not capture.grab():
+                            break
+                        frame_idx += 1
+                    self._tracking_session = None
+                    refresh_detection = True
                 success, frame = capture.read()
                 frame_idx += 1
         finally:
