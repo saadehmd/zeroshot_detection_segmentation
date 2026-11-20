@@ -1,5 +1,5 @@
-vehicles
-containers
-humans
-cranes
-buildings
+vehicle
+container
+human
+crane
+building

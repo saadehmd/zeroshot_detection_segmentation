@@ -1,7 +1,33 @@
+from dataclasses import dataclass
+
 import numpy as np
 from numpy.typing import NDArray
 import torch
 from torchvision.ops import batched_nms
+
+
+@dataclass
+class DetectionResult:
+    """Detection tensors and labels with shapes and counts checked at creation."""
+
+    boxes: torch.Tensor
+    scores: torch.Tensor
+    labels: list[str]
+
+    def __post_init__(self) -> None:
+        self.validate()
+
+    def validate(self) -> None:
+        """Check shapes and matching counts, including for zero detections."""
+        if self.boxes.ndim != 2 or self.boxes.shape[1] != 4:
+            raise ValueError("DetectionResult boxes must have shape (N, 4)")
+        if self.scores.ndim != 1 or not len(self.boxes) == len(self.scores) == len(self.labels):
+            raise ValueError("DetectionResult boxes, scores, and labels must have matching counts")
+
+
+def is_valid_image(frame: NDArray[np.uint8]) -> bool:
+    """Check if the frame is a non-empty BGR image with shape (H, W, 3)."""
+    return frame.ndim == 3 and frame.shape[2] == 3 and frame.size > 0
 
 
 def get_detection_labels_with_max_confidence(logits: torch.Tensor,
@@ -38,21 +64,26 @@ def get_detection_labels_with_max_confidence(logits: torch.Tensor,
     return boxes, scores[keep], [labels[index] for index in class_ids[keep].tolist()]
 
 
-def class_aware_nms(boxes: torch.Tensor,
-                    scores: torch.Tensor,
-                    labels: list[str],
-                    iou_threshold: float = 0.5,
-                    ) -> torch.Tensor:
-    """Return kept XYXY indices sorted by score; labels must already be canonical."""
-    if boxes.ndim != 2 or boxes.shape[1] != 4:
-        raise ValueError("Boxes must have shape (N, 4)")
-    if scores.ndim != 1 or not len(boxes) == len(scores) == len(labels):
-        raise ValueError("Boxes, scores, and labels must have matching counts")
+def class_aware_nms(detections: DetectionResult, iou_threshold: float = 0.5) -> torch.Tensor:
+    """Return surviving XYXY box indices in descending score order.
+
+    Suppress lower-scoring boxes only when they share the same label and their
+    IoU with a kept box exceeds the threshold.
+    """
     if not 0 <= iou_threshold <= 1:
         raise ValueError("NMS IoU threshold must be between 0 and 1")
-    label_ids = {label: index for index, label in enumerate(dict.fromkeys(labels))}
-    classes = torch.tensor([label_ids[label] for label in labels], dtype=torch.int64, device=boxes.device, )
-    return batched_nms(boxes.float(), scores.to(device=boxes.device, dtype=torch.float32), classes, iou_threshold, )
+
+    label_ids = {label: index for index, label in enumerate(dict.fromkeys(detections.labels))}
+
+    classes = torch.tensor([label_ids[label] for label in detections.labels],
+                           dtype=torch.int64,
+                           device=detections.boxes.device,
+                           )
+    return batched_nms(detections.boxes.float(),
+                       detections.scores.to(device=detections.boxes.device, dtype=torch.float32),
+                       classes,
+                       iou_threshold,
+                       )
 
 
 def get_supported_fp16(device: str) -> torch.dtype:
