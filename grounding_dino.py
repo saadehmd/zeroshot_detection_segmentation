@@ -1,5 +1,4 @@
 from dataclasses import dataclass
-from xml.parsers.expat import model
 
 import cv2
 from open_vocab_detector import OpenVocabDetector
@@ -7,7 +6,6 @@ from numpy.typing import NDArray
 import numpy as np
 import torch
 from transformers.models.grounding_dino.modeling_grounding_dino import GroundingDinoObjectDetectionOutput
-from transformers.models.grounding_dino.image_processing_grounding_dino import GroundingDinoImageProcessor
 import utils
 
 
@@ -34,16 +32,16 @@ class GroundingDino(OpenVocabDetector[GroundingDinoInput, GroundingDinoObjectDet
         if not utils.is_valid_image(frame):
             raise ValueError("Frame must be a non-empty BGR image with shape (H, W, 3)")
 
-        inputs = self.__processor(images=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
-                                  text=self.__prompt,
-                                  return_tensors="pt",
-                                  return_offsets_mapping=True,
-                                  ).to(self.__device, self.__dtype)
+        inputs = self._processor(images=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                 text=self._prompt,
+                                 return_tensors="pt",
+                                 return_offsets_mapping=True,
+                                 ).to(self.device, self._dtype)
 
         offsets = inputs.pop("offset_mapping")[0]
         return GroundingDinoInput(inputs=dict(inputs),
                                   offsets=offsets,
-                                  labels=self.__classes,
+                                  labels=self._classes,
                                   image_size=(frame.shape[0], frame.shape[1]),
                                   )
 
@@ -52,12 +50,12 @@ class GroundingDino(OpenVocabDetector[GroundingDinoInput, GroundingDinoObjectDet
         """Select canonical labels, threshold, resize boxes, and apply class-aware NMS."""
         boxes, scores, labels = utils.get_detection_labels_with_max_confidence(
             output.logits[0], output.pred_boxes[0], prepared.offsets,
-            prepared.labels, prepared.image_size, self.__det_threshold,
+            prepared.labels, prepared.image_size, self._det_threshold,
         )
         detections = utils.DetectionResult(boxes, scores, labels)
-        keep = utils.class_aware_nms(detections, self.__nms_iou_threshold)
+        keep = utils.class_aware_nms(detections, self._nms_iou_threshold)
         return utils.DetectionResult(
             boxes=boxes[keep],
             scores=scores[keep],
-            text_labels=[labels[index] for index in keep.tolist()],
+            labels=[labels[index] for index in keep.tolist()],
         )

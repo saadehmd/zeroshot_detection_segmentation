@@ -1,9 +1,33 @@
 from dataclasses import dataclass
+from time import time
 
 import numpy as np
 from numpy.typing import NDArray
 import torch
 from torchvision.ops import batched_nms
+import time
+from functools import wraps
+
+
+def torch_sync_if_cuda_available() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def timed(func):
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+
+        torch_sync_if_cuda_available()
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        torch_sync_if_cuda_available()
+        end = time.perf_counter()
+        duration = (end - start) * 1000
+        return result, duration
+
+    return wrapper
 
 
 @dataclass

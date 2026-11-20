@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar, TypedDict
+from typing import Generic, TypeVar
 from numpy.typing import NDArray
 import numpy as np
 import utils
@@ -27,21 +27,26 @@ class OpenVocabDetector(ABC, Generic[PreparedInput, ModelOutput]):
         if not 0 <= det_threshold <= 1 or not 0 <= nms_iou_threshold <= 1:
             raise ValueError("Detection and NMS thresholds must be between 0 and 1")
 
-        self.__classes = self.normalize_labels(classes)
-        self.__prompt = self.promptify(self.__classes)
-        self.__device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.__dtype = utils.get_supported_fp16(self.__device.type) if use_fp16 else torch.float32
-        self.__det_threshold = det_threshold
-        self.__nms_iou_threshold = nms_iou_threshold
+        self._classes = self.normalize_labels(classes)
+        self._prompt = self.promptify(self._classes)
+        self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._dtype = utils.get_supported_fp16(self._device.type) if use_fp16 else torch.float32
+        self._det_threshold = det_threshold
+        self._nms_iou_threshold = nms_iou_threshold
         self.init_model(model_id)
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
 
     def init_model(self, model_id: str) -> None:
         """Load the processor and model."""
         processor = AutoProcessor.from_pretrained(model_id)
         model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id,
-                                                                    torch_dtype=self.__dtype).to(self.__device).eval()
-        self.__processor, self.__model = processor, model
+                                                                    torch_dtype=self._dtype).to(self.device).eval()
+        self._processor, self.__model = processor, model
 
+    @utils.timed
     def detect(self, frame: NDArray[np.uint8]) -> utils.DetectionResult:
         """Run the complete pipeline and return absolute XYXY boxes and labels."""
         prepared = self.preprocess(frame)

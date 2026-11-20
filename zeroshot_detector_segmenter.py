@@ -1,17 +1,13 @@
 """Detect and segment video objects; press Q or Escape to stop.
 
-Press Right Arrow to skip the next 10 frames. Skipped frames are not inferred
-or included in the saved output video.
-Usage: python ground_dino_detector.py input.mp4 classes.txt --output-vid annotated.mp4
+Use Up/Down to adjust the skip step (initially 10), and Right/Left to seek.
+Skipped frames are not processed or saved.
+Usage: python zeroshot_detector_segmenter.py input.mp4 classes.txt --output-vid annotated.mp4
 The required UTF-8 classes file contains one label per line. Blank lines are
 ignored; labels are lowercased and deduplicated in file order.
 Omit --output-vid to display results without saving them.
-OpenVocabSegmentationApp.detect(frame) uses the instance's classes and accepts a BGR frame
-and returns detections
-and inference time in milliseconds. The constructor initializes both models
-and processors; pass fp16=True to select reduced precision.
-initDetector(model_id) explicitly loads or replaces the cached detector using
-Auto factories. detect() requires compatible grounded-detection processing.
+ZeroShotDetectorSegmenter.detect(frame) uses GroundingDino and returns detections
+and inference time in milliseconds. Pass fp16=True to select reduced precision.
 Detection assigns each box the configured label with the highest token score,
 excluding special/separator tokens, before thresholding and class-aware NMS.
 No text threshold or free-form label decoding is used.
@@ -22,26 +18,22 @@ The displayed inference time includes detection and segmentation.
 
 import argparse
 from colorsys import hsv_to_rgb
+from functools import partial
 import math
 from pathlib import Path
-from time import perf_counter
 from typing import TypedDict
 
 import cv2
 import numpy as np
 from numpy.typing import NDArray
 import torch
-from transformers import (AutoProcessor, AutoModelForZeroShotObjectDetection, Sam2Processor, Sam2Model, )
-from utils import get_supported_fp16, class_aware_nms, get_detection_labels_with_max_confidence
+from transformers import Sam2Processor, Sam2Model
+from detector_gui import DetectorGui
+from grounding_dino import GroundingDino
+import utils
 
 
-class DetectionResult(TypedDict):
-    boxes: torch.Tensor
-    scores: torch.Tensor
-    text_labels: list[str]
-
-
-class OpenVocabSegmentationApp:
+class ZeroShotDetectorSegmenter:
 
     def __init__(self, classes_file: Path | str, fp16: bool = False) -> None:
         labels = Path(classes_file).read_text(encoding="utf-8").splitlines()
@@ -64,73 +56,38 @@ class OpenVocabSegmentationApp:
         return colors
 
     def initDetector(self, model_id: str = "IDEA-Research/grounding-dino-tiny") -> None:
-        """Load a zero-shot detector and processor, replacing the cache on success."""
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using {device} for inference")
-
-        dtype = (get_supported_fp16(device) if self._fp16 else torch.float32)
-        processor = AutoProcessor.from_pretrained(model_id)
-        model = AutoModelForZeroShotObjectDetection.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
-        self._det_processor, self._det_model = processor, model
+        """Create the shared detector with this app's configuration."""
+        self._detector = GroundingDino(self.classes,
+                                       det_threshold=0.2,
+                                       nms_iou_threshold=0.5,
+                                       use_fp16=self._fp16,
+                                       model_id=model_id)
 
     def initSegmenter(self, model_id: str = "facebook/sam2-hiera-tiny") -> None:
         """Load a segmenter and processor, replacing the cache on success."""
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Using {device} for inference")
-        dtype = (get_supported_fp16(device) if self._fp16 else torch.float32)
+        dtype = (utils.get_supported_fp16(device) if self._fp16 else torch.float32)
         processor = Sam2Processor.from_pretrained(model_id)
         model = Sam2Model.from_pretrained(model_id, torch_dtype=dtype).to(device).eval()
         self._sam_processor, self._sam_model = processor, model
 
-    def detect(self, frame: NDArray[np.uint8]) -> tuple[DetectionResult, float]:
-        """Return one configured label per box, class-aware NMS (IoU 0.5), and ms."""
-        text_prompt = " . ".join(self.classes) + " ."
-
-        device = self._det_model.device
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        start = perf_counter()
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        inputs = self._det_processor(images=rgb_frame,
-                                     text=text_prompt,
-                                     return_tensors="pt",
-                                     return_offsets_mapping=True).to(device, self._det_model.dtype)
-        offsets = inputs.pop("offset_mapping")[0]
-        with torch.inference_mode():
-            outputs = self._det_model(**inputs)
-            boxes, scores, labels = get_detection_labels_with_max_confidence(
-                outputs.logits[0], outputs.pred_boxes[0], offsets,
-                self.classes, frame.shape[:2], threshold=0.2,
-            )
-            results = {"boxes": boxes, "scores": scores, "text_labels": labels}
-        keep = class_aware_nms(results["boxes"], results["scores"], results["text_labels"])
-        results = {
-            "boxes": results["boxes"][keep],
-            "scores": results["scores"][keep.to(results["scores"].device)],
-            "text_labels": [results["text_labels"][index] for index in keep.tolist()],
-        }
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        inference_ms = (perf_counter() - start) * 1000
-        return results, inference_ms
-
-    def segment(self, frame: NDArray[np.uint8], detections: DetectionResult) -> NDArray[np.uint8]:
+    @utils.timed
+    def segment(self, frame: NDArray[np.uint8], detections: utils.DetectionResult) -> NDArray[np.uint8]:
         """Return the highest-IoU binary mask per box at the original frame size."""
-        boxes = detections["boxes"]
-        if boxes.ndim != 2 or boxes.shape[1] != 4:
-            raise ValueError("Detection boxes must have shape (N, 4)")
-        if len(boxes) == 0:
+
+        if len(detections.boxes) == 0:
             return np.empty((0, *frame.shape[:2]), dtype=np.uint8)
         device = self._sam_model.device
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         inputs = self._sam_processor(images=rgb_frame,
-                                     input_boxes=[boxes.detach().cpu().tolist()],
+                                     input_boxes=[detections.boxes.detach().cpu().tolist()],
                                      return_tensors="pt",
                                      ).to(device, self._sam_model.dtype)
         with torch.inference_mode():
             outputs = self._sam_model(**inputs)
             best_indices = outputs.iou_scores[0].argmax(dim=-1)
-            box_indices = torch.arange(len(boxes), device=best_indices.device)
+            box_indices = torch.arange(len(detections.boxes), device=best_indices.device)
             best_masks = outputs.pred_masks[0][box_indices, best_indices]
             masks = self._sam_processor.post_process_masks(best_masks.unsqueeze(0).unsqueeze(2).float().cpu(),
                                                            inputs["original_sizes"].cpu(),
@@ -138,12 +95,16 @@ class OpenVocabSegmentationApp:
                                                            )[0][:, 0]
         return masks.detach().cpu().numpy().astype(np.uint8)
 
-    def draw(self, frame: NDArray[np.uint8], detections: DetectionResult, masks: NDArray[np.uint8] | None,
+    def draw(self,
+             frame: NDArray[np.uint8],
+             detections: utils.DetectionResult,
+             masks: NDArray[np.uint8] | None,
+             timing_text: str | None = None,
              ) -> NDArray[np.uint8]:
-        """Return a frame copy with mask overlays, boxes, labels, and scores."""
-        boxes = detections["boxes"].detach().cpu().tolist()
-        scores = detections["scores"].detach().cpu().tolist()
-        labels = detections["text_labels"]
+        """Return a frame copy with masks, boxes, labels, scores, and optional timing text."""
+        boxes = detections.boxes.detach().cpu().tolist()
+        scores = detections.scores.detach().cpu().tolist()
+        labels = detections.labels
         if not len(boxes) == len(scores) == len(labels):
             raise ValueError("Detection boxes, scores, and labels must have matching counts")
         if masks is not None and masks.shape != (len(boxes), *frame.shape[:2]):
@@ -172,6 +133,9 @@ class OpenVocabSegmentationApp:
                         color,
                         2,
                         )
+        if timing_text is not None:
+            for color, thickness in [((0, 0, 0), 4), ((255, 255, 255), 2)]:
+                cv2.putText(frame, timing_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness)
         return frame
 
     @staticmethod
@@ -194,58 +158,38 @@ class OpenVocabSegmentationApp:
                 parser.error("--output-vid must have an .mp4 or .avi extension")
         return args
 
+    def _process_frame(self, frame: NDArray[np.uint8], *, output_path: Path = None) -> None:
+        """Annotate a frame in place and optionally write it to the output video."""
+        if output_path is not None and self._writer is None:
+            height, width = frame.shape[:2]
+            codec = "mp4v" if output_path.suffix.lower() == ".mp4" else "MJPG"
+            self._writer = cv2.VideoWriter(str(output_path),
+                                           cv2.VideoWriter_fourcc(*codec),
+                                           self._gui.fps, (width, height))
+            if not self._writer.isOpened():
+                raise RuntimeError(f"Could not create output video: {output_path}")
+
+        results, det_ms = self._detector.detect(frame)
+        masks, seg_ms = self.segment(frame, results)
+
+        timing_text = f"Inference: {det_ms + seg_ms:.1f} ms"
+        frame[:] = self.draw(frame, results, masks, timing_text)
+
+        if self._writer is not None:
+            self._writer.write(frame)
+
     def main(self, args: argparse.Namespace) -> None:
-        capture = cv2.VideoCapture(str(args.video))
-        writer = None
+        self._gui = DetectorGui(str(args.video), skip_step=10)
+        self._writer: cv2.VideoWriter | None = None
         try:
-            if not capture.isOpened():
-                raise RuntimeError(f"Could not open video: {args.video}")
-            success, frame = capture.read()
-            if not success:
+            self._gui.run(partial(self._process_frame, output_path=args.output_vid))
+            if self._gui.frame_index < 0:
                 raise RuntimeError(f"Could not read the first frame: {args.video}")
-
-            if args.output_vid:
-                fps = capture.get(cv2.CAP_PROP_FPS)
-                if not math.isfinite(fps) or fps <= 0:
-                    raise RuntimeError(f"Invalid source video frame rate: {fps}")
-                height, width = frame.shape[:2]
-                codec = "mp4v" if args.output_vid.suffix.lower() == ".mp4" else "MJPG"
-                writer = cv2.VideoWriter(str(args.output_vid), cv2.VideoWriter_fourcc(*codec), fps, (width, height), )
-                if not writer.isOpened():
-                    raise RuntimeError(f"Could not create output video: {args.output_vid}")
-
-            window_name = "Grounding DINO - Right: skip 10 frames | Q / Esc: quit"
-            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-            while success:
-                results, inference_ms = self.detect(frame)
-                start = perf_counter()
-                masks = self.segment(frame, results)
-                inference_ms += (perf_counter() - start) * 1000
-                frame = self.draw(frame, results, masks)
-
-                timing_text = f"Inference: {inference_ms:.1f} ms"
-                for color, thickness in [((0, 0, 0), 4), ((255, 255, 255), 2)]:
-                    cv2.putText(frame, timing_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness, )
-                if writer is not None:
-                    writer.write(frame)
-                cv2.imshow(window_name, frame)
-                key = cv2.waitKeyEx(1)
-                if key in (ord("q"), 27):
-                    break
-                if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
-                    break
-                if key in (65363, 2555904, 16777236):
-                    for _ in range(10):
-                        if not capture.grab():
-                            break
-                success, frame = capture.read()
         finally:
-            capture.release()
-            if writer is not None:
-                writer.release()
-            cv2.destroyAllWindows()
+            if self._writer is not None:
+                self._writer.release()
 
 
 if __name__ == "__main__":
-    args = OpenVocabSegmentationApp.parse_args()
-    OpenVocabSegmentationApp(args.classes_file, fp16=args.fp16).main(args)
+    args = ZeroShotDetectorSegmenter.parse_args()
+    ZeroShotDetectorSegmenter(args.classes_file, fp16=args.fp16).main(args)
