@@ -34,6 +34,8 @@ import utils
 
 
 class ZeroShotDetectorSegmenter:
+    _detection_threshold = 0.2
+    _cli_description = __doc__
 
     def __init__(self, classes_file: Path | str, fp16: bool = False) -> None:
         labels = Path(classes_file).read_text(encoding="utf-8").splitlines()
@@ -58,7 +60,7 @@ class ZeroShotDetectorSegmenter:
     def initDetector(self, model_id: str = "IDEA-Research/grounding-dino-tiny") -> None:
         """Create the shared detector with this app's configuration."""
         self._detector = GroundingDino(self.classes,
-                                       det_threshold=0.2,
+                                       det_threshold=self._detection_threshold,
                                        nms_iou_threshold=0.5,
                                        use_fp16=self._fp16,
                                        model_id=model_id)
@@ -73,7 +75,7 @@ class ZeroShotDetectorSegmenter:
         self._sam_processor, self._sam_model = processor, model
 
     @utils.timed
-    def segment(self, frame: NDArray[np.uint8], detections: utils.DetectionResult) -> NDArray[np.uint8]:
+    def _segment(self, frame: NDArray[np.uint8], detections: utils.DetectionResult) -> NDArray[np.uint8]:
         """Return the highest-IoU binary mask per box at the original frame size."""
 
         if len(detections.boxes) == 0:
@@ -138,10 +140,10 @@ class ZeroShotDetectorSegmenter:
                 cv2.putText(frame, timing_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, thickness)
         return frame
 
-    @staticmethod
-    def parse_args() -> argparse.Namespace:
+    @classmethod
+    def parse_args(cls) -> argparse.Namespace:
         """Parse and validate CLI arguments before loading models."""
-        parser = argparse.ArgumentParser(description=__doc__)
+        parser = argparse.ArgumentParser(description=cls._cli_description)
         parser.add_argument("video", type=Path, help="Path to the input video")
         parser.add_argument("classes_file", type=Path, help="Required UTF-8 text file, one class label per line")
         parser.add_argument("--output-vid", type=Path, help="Optional output video path (.mp4 or .avi)")
@@ -158,9 +160,9 @@ class ZeroShotDetectorSegmenter:
                 parser.error("--output-vid must have an .mp4 or .avi extension")
         return args
 
-    def _process_frame(self, frame: NDArray[np.uint8], *, output_path: Path = None) -> None:
-        """Annotate a frame in place and optionally write it to the output video."""
-        if output_path is not None and self._writer is None:
+    def _initialize_video_writer(self, output_path: Path, frame: NDArray[np.uint8]) -> None:
+        """Initialize the video writer if it hasn't been created yet."""
+        if self._writer is None:
             height, width = frame.shape[:2]
             codec = "mp4v" if output_path.suffix.lower() == ".mp4" else "MJPG"
             self._writer = cv2.VideoWriter(str(output_path),
@@ -169,10 +171,18 @@ class ZeroShotDetectorSegmenter:
             if not self._writer.isOpened():
                 raise RuntimeError(f"Could not create output video: {output_path}")
 
+    def _infer_frame(self, frame: NDArray[np.uint8], ) -> tuple[utils.DetectionResult, NDArray[np.uint8], float]:
         results, det_ms = self._detector.detect(frame)
-        masks, seg_ms = self.segment(frame, results)
+        masks, seg_ms = self._segment(frame, results)
+        return results, masks, det_ms + seg_ms
 
-        timing_text = f"Inference: {det_ms + seg_ms:.1f} ms"
+    def _process_frame(self, frame: NDArray[np.uint8], *, output_path: Path | None = None) -> None:
+        """Annotate a frame in place and optionally write it to the output video."""
+        if output_path is not None:
+            self._initialize_video_writer(output_path, frame)
+
+        results, masks, inference_ms = self._infer_frame(frame)
+        timing_text = f"Inference: {inference_ms:.1f} ms"
         frame[:] = self.draw(frame, results, masks, timing_text)
 
         if self._writer is not None:

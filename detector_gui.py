@@ -7,6 +7,7 @@ from numpy.typing import NDArray
 import utils
 from typing import Dict
 
+# Todo: Replace with on-screen buttons since these keys have different mappings on different platforms.
 UP_KEY = 2490368
 DOWN_KEY = 2621440
 RIGHT_KEY = 2555904
