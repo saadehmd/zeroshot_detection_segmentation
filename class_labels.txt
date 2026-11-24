@@ -1,5 +1,7 @@
 vehicle
 container
+shipping-container
 human
+utility-pole
 crane
 building

@@ -38,14 +38,11 @@ class ZeroShotDetectorSegmenter:
     _cli_description = __doc__
 
     def __init__(self, classes_file: Path | str, fp16: bool = False) -> None:
-        labels = Path(classes_file).read_text(encoding="utf-8").splitlines()
-        self.classes = list(dict.fromkeys(" ".join(label.lower().split()) for label in labels if label.strip()))
-        if not self.classes:
-            raise ValueError("The classes file must contain at least one non-empty label")
-        self.label_colors = self.initColorPalette(self.classes)
+
         self._fp16 = fp16
-        self.initDetector()
+        self.initDetector(classes_file)
         self.initSegmenter()
+        self.label_colors = self.initColorPalette(self._detector.classes)
 
     @staticmethod
     def initColorPalette(classes: list[str]) -> dict[str, tuple[int, int, int]]:
@@ -57,9 +54,9 @@ class ZeroShotDetectorSegmenter:
             colors[label] = (round(blue * 255), round(green * 255), round(red * 255))
         return colors
 
-    def initDetector(self, model_id: str = "IDEA-Research/grounding-dino-tiny") -> None:
+    def initDetector(self, prompt: str, model_id: str = "IDEA-Research/grounding-dino-tiny") -> None:
         """Create the shared detector with this app's configuration."""
-        self._detector = GroundingDino(self.classes,
+        self._detector = GroundingDino(prompt=prompt,
                                        det_threshold=self._detection_threshold,
                                        nms_iou_threshold=0.5,
                                        use_fp16=self._fp16,
@@ -113,7 +110,7 @@ class ZeroShotDetectorSegmenter:
             raise ValueError("Masks must have shape (N, frame height, frame width)")
         unknown_labels = set(labels) - self.label_colors.keys()
         if unknown_labels:
-            raise ValueError(f"Detected labels are not in the classes file: {sorted(unknown_labels)}")
+            raise ValueError(f"Detected labels are not in the query list: {sorted(unknown_labels)}")
         colors = [self.label_colors[label] for label in labels]
         frame = frame.copy()
         if masks is not None:

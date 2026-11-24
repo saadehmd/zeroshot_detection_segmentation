@@ -54,18 +54,23 @@ def is_valid_image(frame: NDArray[np.uint8]) -> bool:
     return frame.ndim == 3 and frame.shape[2] == 3 and frame.size > 0
 
 
-def get_detection_labels_with_max_confidence(logits: torch.Tensor,
-                                             pred_boxes: torch.Tensor,
-                                             offsets: torch.Tensor,
-                                             labels: list[str],
-                                             image_size: tuple[int, int],
-                                             threshold: float,
-                                             ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
-    """Assign each query its highest-scoring class, then threshold and resize XYXY boxes.
+def get_detection_labels_with_max_confidences(logits: torch.Tensor,
+                                              pred_boxes: torch.Tensor,
+                                              offsets: torch.Tensor,
+                                              labels: list[str],
+                                              image_size: tuple[int, int],
+                                              threshold: float,
+                                              top_k: int,
+                                              ) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+    """Return one box and joined top-k label per query with a qualifying class.
 
     Offsets must come from tokenizing ' . '.join(labels) + ' .'. A class score
     is its maximum token probability; separator and special tokens are excluded.
+    Qualifying class names are joined in descending confidence order. The box
+    score is the highest class probability, not a combined phrase confidence.
     """
+    if not labels or top_k < 1:
+        raise ValueError("Class labels must be non-empty and top_k must be positive")
     token_offsets = offsets.detach().cpu().tolist()
     class_scores = []
     start = 0
@@ -79,13 +84,21 @@ def get_detection_labels_with_max_confidence(logits: torch.Tensor,
             raise ValueError(f"No prompt tokens found for class {label!r}; check prompt truncation")
         class_scores.append(logits[:, indices].sigmoid().amax(dim=-1))
         start = end + 3
-    scores, class_ids = torch.stack(class_scores, dim=-1).max(dim=-1)
-    keep = scores > threshold
-    centers, sizes = pred_boxes[keep].chunk(2, dim=-1)
+    scores, class_ids = torch.stack(class_scores, dim=-1).topk(min(top_k, len(labels)), dim=-1)
+    classes_above_threshold = scores > threshold
+    queries_with_valid_classes = classes_above_threshold[:, 0]
+    joined_labels = [
+        " ".join(labels[index] for index in ids[qualifies].tolist())
+        for ids, qualifies in zip(
+            class_ids[queries_with_valid_classes],
+            classes_above_threshold[queries_with_valid_classes],
+        )
+    ]
+    centers, sizes = pred_boxes[queries_with_valid_classes].chunk(2, dim=-1)
     boxes = torch.cat((centers - sizes / 2, centers + sizes / 2), dim=-1)
     height, width = image_size
     boxes = boxes * boxes.new_tensor([width, height, width, height])
-    return boxes, scores[keep], [labels[index] for index in class_ids[keep].tolist()]
+    return boxes, scores[queries_with_valid_classes, 0], joined_labels
 
 
 def class_aware_nms(detections: DetectionResult, iou_threshold: float = 0.5) -> torch.Tensor:

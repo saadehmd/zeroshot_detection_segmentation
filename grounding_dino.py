@@ -18,13 +18,13 @@ class GroundingDinoInput:
 
 
 class GroundingDino(OpenVocabDetector[GroundingDinoInput, GroundingDinoObjectDetectionOutput]):
-    """Grounding DINO with one configured class per query and class-aware NMS.
+    """Grounding DINO with up to two joined classes per box and class-aware NMS.
 
-    Frames are OpenCV BGR images. Returned scores are the winning class's
-    maximum token probability. No free-form text decoding is performed.
+    Frames are OpenCV BGR images. Qualifying class names are joined in descending
+    confidence order; returned scores are the highest class token probability.
     """
 
-    def promptify(self, classes: list[str]) -> str:
+    def create_model_prompt(self, classes: list[str]) -> str:
         return " . ".join(classes) + " ."
 
     def preprocess(self, frame: NDArray[np.uint8]) -> GroundingDinoInput:
@@ -42,20 +42,22 @@ class GroundingDino(OpenVocabDetector[GroundingDinoInput, GroundingDinoObjectDet
         return GroundingDinoInput(inputs=dict(inputs),
                                   offsets=offsets,
                                   labels=self._classes,
-                                  image_size=(frame.shape[0], frame.shape[1]),
-                                  )
+                                  image_size=(frame.shape[0], frame.shape[1]))
 
     def postprocess(self, output: GroundingDinoObjectDetectionOutput,
                     prepared: GroundingDinoInput) -> utils.DetectionResult:
-        """Select canonical labels, threshold, resize boxes, and apply class-aware NMS."""
-        boxes, scores, labels = utils.get_detection_labels_with_max_confidence(
-            output.logits[0], output.pred_boxes[0], prepared.offsets,
-            prepared.labels, prepared.image_size, self._det_threshold,
-        )
+        """Join qualifying classes, canonicalize/prune labels, and apply class-aware NMS."""
+        boxes, scores, labels = utils.get_detection_labels_with_max_confidences(output.logits[0],
+                                                                                output.pred_boxes[0],
+                                                                                prepared.offsets,
+                                                                                prepared.labels,
+                                                                                prepared.image_size,
+                                                                                self._det_threshold,
+                                                                                top_k=2)
         detections = utils.DetectionResult(boxes, scores, labels)
+        detections = self.prune_detections_with_spurious_labels(detections)
         keep = utils.class_aware_nms(detections, self._nms_iou_threshold)
-        return utils.DetectionResult(
-            boxes=boxes[keep],
-            scores=scores[keep],
-            labels=[labels[index] for index in keep.tolist()],
-        )
+        return utils.DetectionResult(boxes=detections.boxes[keep],
+                                     scores=detections.scores[keep],
+                                     labels=[detections.labels[index] for index in keep.tolist()],
+                                     )
